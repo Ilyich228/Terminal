@@ -8,31 +8,38 @@
 // STARTF_USESTDHANDLES is only defined in WINAPI_PARTITION_DESKTOP
 // We're just gonna manually define it for this prototyping code
 #ifndef STARTF_USESTDHANDLES
-#define STARTF_USESTDHANDLES       0x00000100
+#define STARTF_USESTDHANDLES 0x00000100
 #endif
 
+#include "ConhostConnection.g.cpp"
+
 #include <conpty-universal.h>
+#include "../../types/inc/Utils.hpp"
+
+using namespace ::Microsoft::Console;
 
 namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 {
-    ConhostConnection::ConhostConnection(hstring const& commandline,
-                                         hstring const& startingDirectory,
-                                        uint32_t initialRows,
-                                        uint32_t initialCols) :
-        _connected{ false },
-        _inPipe{ INVALID_HANDLE_VALUE },
-        _outPipe{ INVALID_HANDLE_VALUE },
-        _signalPipe{ INVALID_HANDLE_VALUE },
-        _outputThreadId{ 0 },
-        _hOutputThread{ INVALID_HANDLE_VALUE },
-        _piConhost{ 0 },
-        _closing{ false }
+    ConhostConnection::ConhostConnection(const hstring& commandline,
+                                         const hstring& startingDirectory,
+                                         const uint32_t initialRows,
+                                         const uint32_t initialCols,
+                                         const guid& initialGuid) :
+        _initialRows{ initialRows },
+        _initialCols{ initialCols },
+        _commandline{ commandline },
+        _startingDirectory{ startingDirectory },
+        _guid{ initialGuid }
     {
-        _commandline = commandline;
-        _startingDirectory = startingDirectory;
-        _initialRows = initialRows;
-        _initialCols = initialCols;
+        if (_guid == guid{})
+        {
+            _guid = Utils::CreateGuid();
+        }
+    }
 
+    winrt::guid ConhostConnection::Guid() const noexcept
+    {
+        return _guid;
     }
 
     winrt::event_token ConhostConnection::TerminalOutput(Microsoft::Terminal::TerminalConnection::TerminalOutputEventArgs const& handler)
@@ -57,45 +64,79 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 
     void ConhostConnection::Start()
     {
-        std::wstring cmdline = _commandline.c_str();
+        std::wstring cmdline{ _commandline.c_str() };
         std::optional<std::wstring> startingDirectory;
         if (!_startingDirectory.empty())
         {
             startingDirectory = _startingDirectory;
         }
 
-        CreateConPty(cmdline,
-                     startingDirectory,
-                     static_cast<short>(_initialCols),
-                     static_cast<short>(_initialRows),
-                     &_inPipe,
-                     &_outPipe,
-                     &_signalPipe,
-                     &_piConhost);
+        EnvironmentVariableMapW extraEnvVars;
+        {
+            // Convert connection Guid to string and ignore the enclosing '{}'.
+            std::wstring wsGuid{ Utils::GuidToString(_guid) };
+            wsGuid.pop_back();
 
-        _connected = true;
+            const wchar_t* const pwszGuid{ wsGuid.data() + 1 };
+
+            // Ensure every connection has the unique identifier in the environment.
+            extraEnvVars.emplace(L"WT_SESSION", pwszGuid);
+        }
+
+        THROW_IF_FAILED(
+            CreateConPty(cmdline,
+                         startingDirectory,
+                         static_cast<short>(_initialCols),
+                         static_cast<short>(_initialRows),
+                         &_inPipe,
+                         &_outPipe,
+                         &_signalPipe,
+                         &_piConhost,
+                         CREATE_SUSPENDED,
+                         extraEnvVars));
+
+        _hJob.reset(CreateJobObjectW(nullptr, nullptr));
+        THROW_LAST_ERROR_IF_NULL(_hJob);
+
+        // We want the conhost and all associated descendant processes
+        // to be terminated when the tab is closed. GUI applications
+        // spawned from the shell tend to end up in their own jobs.
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobExtendedInformation{};
+        jobExtendedInformation.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        THROW_IF_WIN32_BOOL_FALSE(SetInformationJobObject(_hJob.get(),
+                                                          JobObjectExtendedLimitInformation,
+                                                          &jobExtendedInformation,
+                                                          sizeof(jobExtendedInformation)));
+
+        THROW_IF_WIN32_BOOL_FALSE(AssignProcessToJobObject(_hJob.get(), _piConhost.hProcess));
 
         // Create our own output handling thread
-        // Each console needs to make sure to drain the output from its backing host.
-        _outputThreadId = (DWORD)-1;
-        _hOutputThread = CreateThread(nullptr,
-                                      0,
-                                      StaticOutputThreadProc,
-                                      this,
-                                      0,
-                                      &_outputThreadId);
+        // Each connection needs to make sure to drain the output from its backing host.
+        _hOutputThread.reset(CreateThread(nullptr,
+                                          0,
+                                          StaticOutputThreadProc,
+                                          this,
+                                          0,
+                                          nullptr));
+
+        // Wind up the conhost! We only do this after we've got everything in place.
+        THROW_LAST_ERROR_IF(-1 == ResumeThread(_piConhost.hThread));
+
+        _connected = true;
     }
 
     void ConhostConnection::WriteInput(hstring const& data)
     {
-        if (!_connected || _closing)
+        if (!_connected || _closing.load())
         {
             return;
         }
 
         // convert from UTF-16LE to UTF-8 as ConPty expects UTF-8
         std::string str = winrt::to_string(data);
-        bool fSuccess = !!WriteFile(_inPipe, str.c_str(), (DWORD)str.length(), nullptr, nullptr);
+        bool fSuccess = !!WriteFile(_inPipe.get(), str.c_str(), (DWORD)str.length(), nullptr, nullptr);
         fSuccess;
     }
 
@@ -106,29 +147,31 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             _initialRows = rows;
             _initialCols = columns;
         }
-        else if (!_closing)
+        else if (!_closing.load())
         {
-            SignalResizeWindow(_signalPipe, static_cast<unsigned short>(columns), static_cast<unsigned short>(rows));
+            SignalResizeWindow(_signalPipe.get(), Utils::ClampToShortMax(columns, 1), Utils::ClampToShortMax(rows, 1));
         }
     }
 
     void ConhostConnection::Close()
     {
-        if (!_connected) return;
-        if (_closing) return;
-        _closing = true;
-        // TODO:
-        //      terminate the output thread
-        //      Close our handles
-        //      Close the Pseudoconsole
-        //      terminate our processes
-        CloseHandle(_signalPipe);
-        CloseHandle(_inPipe);
-        CloseHandle(_outPipe);
-        // What? CreateThread is in app partition but TerminateThread isn't?
-        //TerminateThread(_hOutputThread, 0);
-        TerminateProcess(_piConhost.hProcess, 0);
-        CloseHandle(_piConhost.hProcess);
+        if (!_connected)
+        {
+            return;
+        }
+
+        if (!_closing.exchange(true))
+        {
+            _hJob.reset(); // This will terminate the process _piConhost is holding.
+            _piConhost.reset();
+
+            _inPipe.reset();
+            _outPipe.reset();
+            _signalPipe.reset();
+
+            WaitForSingleObject(_hOutputThread.get(), INFINITE);
+            _hOutputThread.reset();
+        }
     }
 
     DWORD WINAPI ConhostConnection::StaticOutputThreadProc(LPVOID lpParameter)
@@ -147,10 +190,10 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             dwRead = 0;
             bool fSuccess = false;
 
-            fSuccess = !!ReadFile(_outPipe, buffer, bufferSize, &dwRead, nullptr);
+            fSuccess = !!ReadFile(_outPipe.get(), buffer, bufferSize, &dwRead, nullptr);
             if (!fSuccess)
             {
-                if (_closing)
+                if (_closing.load())
                 {
                     // This is okay, break out to kill the thread
                     return 0;
@@ -160,12 +203,14 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                     _disconnectHandlers();
                     return (DWORD)-1;
                 }
-
             }
-            if (dwRead == 0) continue;
+            if (dwRead == 0)
+            {
+                continue;
+            }
             // Convert buffer to hstring
             char* pchStr = (char*)(buffer);
-            std::string str{pchStr, dwRead};
+            std::string str{ pchStr, dwRead };
             auto hstr = winrt::to_hstring(str);
 
             // Pass the output to our registered event handlers
